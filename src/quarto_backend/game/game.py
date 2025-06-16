@@ -1,8 +1,14 @@
+import logging
+import random
 import time
 import uuid
 
-from quarto_lib import Cell, Piece, Turn
+from quarto_lib import Cell, GameState, Piece, Turn
 from quarto_lib import Game as QuartoGame
+
+from quarto_backend.game.agent_handler import AgentHandler
+
+logger = logging.getLogger(__name__)
 
 
 class Game:
@@ -11,6 +17,7 @@ class Game:
         self._players: list[str | None] = [None, None]
         self._game = QuartoGame()
         self._start_timestamp = None
+        self._agent: AgentHandler | None = None
 
     @property
     def id(self) -> str:
@@ -21,14 +28,18 @@ class Game:
         return self._players.copy()
 
     @property
-    def has_started(self) -> bool:
+    def is_started(self) -> bool:
         return self._start_timestamp is not None
 
     @property
     def current_player(self) -> str | None:
-        if not self.has_started:
+        if not self.is_started:
             return None
         return self._players[self._game.current_player]
+
+    @property
+    def is_pve(self) -> bool:
+        return self._agent is not None
 
     @property
     def current_turn(self) -> Turn:
@@ -41,6 +52,10 @@ class Game:
     @property
     def available_pieces(self) -> list[Piece]:
         return self._game.available_pieces
+
+    @property
+    def available_cells(self) -> list[Cell]:
+        return self._game.available_cells
 
     def is_full(self) -> bool:
         return all(player is not None for player in self._players)
@@ -57,6 +72,13 @@ class Game:
             if self._players[i] is None:
                 self._players[i] = player_id
                 break
+
+    async def setup_pve(self, agent_endpoint: str):
+        if self.is_full():
+            raise ValueError("Game is full, cannot add more players.")
+        agent = await AgentHandler(agent_endpoint).initialize()
+        self.join(agent.identifier)
+        self._agent = agent
 
     def has_player(self, player_id: str) -> bool:
         return player_id in self._players
@@ -83,6 +105,37 @@ class Game:
 
     def place_piece(self, cell: Cell):
         self._game.place_piece(cell)
+
+    async def agent_turn(self):
+        if self._agent is None:
+            raise ValueError("No agent configured for this game.")
+        if self.current_player != self._agent.identifier:
+            raise ValueError("It's not the agent's turn.")
+
+        if self.current_piece is None:
+            logger.debug("Agent is choosing the initial piece.")
+            try:
+                response = await self._agent.choose_initial_piece()
+                logger.debug(f"Agent chose piece: {response.piece}")
+                self.choose_piece(response.piece)
+            except RuntimeError as e:
+                logger.error(f"Agent error during initial piece selection: {e}")
+                self.choose_piece(random.choice(self.available_pieces))
+
+            return
+
+        logger.debug("Agent is completing its turn.")
+        try:
+            response = await self._agent.complete_turn(GameState(current_piece=self.current_piece, board=self.board))
+            logger.debug(f"Agent completed turn with response: {response}")
+            self.place_piece(response.cell)
+            if response.piece is not None:
+                self.choose_piece(response.piece)
+        except RuntimeError as e:
+            logger.error(f"Agent error during turn completion: {e}")
+            self.place_piece(random.choice(self.available_cells))
+            if self.winner is None:
+                self.choose_piece(random.choice(self.available_pieces))
 
     @property
     def current_piece(self) -> Piece | None:

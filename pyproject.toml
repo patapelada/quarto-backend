@@ -5,7 +5,7 @@ description = "Default template for PDM package"
 authors = [
     {name = "patapelada", email = "77882237+patapelada@users.noreply.github.com"},
 ]
-dependencies = ["fastapi[standard]>=0.115.12", "uvicorn>=0.34.3", "python-socketio>=5.13.0", "quarto-lib>=2.1.7"]
+dependencies = ["fastapi[standard]>=0.115.12", "uvicorn>=0.34.3", "python-socketio>=5.13.0", "pydantic-socketio>=0.1.1", "requests>=2.32.4"]
 requires-python = "==3.13.*"
 readme = "README.md"
 license = {text = "MIT"}
@@ -16,3 +16,7 @@ distribution = false
 
 [tool.pdm.scripts]
 dev = "dotenv run -- uvicorn quarto_backend.main:app --reload"
+[tool.pdm.dev-dependencies]
+dev = [
+    "-e file:///${PROJECT_ROOT}/../quarto-lib#egg=quarto-lib",
+]

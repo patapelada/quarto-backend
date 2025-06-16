@@ -3,54 +3,71 @@ import os
 from enum import Enum
 from typing import Literal, TypedDict
 
-import socketio  # type: ignore[reportMissingModuleSource]
+import pydantic_socketio
+from pydantic import BaseModel
 from quarto_lib import Cell, Piece, Turn
 
 from quarto_backend.db import InMemoryDB
 from quarto_backend.game.game import Game
 
 allowed_origins = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+agent = os.getenv("AGENT_ENDPOINT", None)
 
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins=allowed_origins)
+sio = pydantic_socketio.AsyncServer(async_mode="asgi", cors_allowed_origins=allowed_origins)
 
 logger = logging.getLogger(__name__)
 db = InMemoryDB[str, Game]()
 
 
-class PlayerLeftResponse(TypedDict):
+class PlayerLeftResponse(BaseModel):
     playerId: str
 
 
-class GameJoinedResponse(TypedDict):
+class GameJoinedResponse(BaseModel):
     gameId: str
     players: list[str | None]
 
 
-class GameStartedResponse(TypedDict):
+class GameStartedResponse(BaseModel):
     gameId: str
 
 
-class PlayerJoinedResponse(TypedDict):
+class PlayerJoinedResponse(BaseModel):
     gameId: str
     playerId: str
 
 
-class JoinGameRequest(TypedDict):
+class JoinGameRequest(BaseModel):
     gameId: str
 
 
-class StartGameRequest(TypedDict):
+class StartGameRequest(BaseModel):
     gameId: str
 
 
-class GenericErrorResponse(TypedDict):
+class GenericErrorResponse(BaseModel):
     key: str
     message: str
 
 
-class SelectPieceRequest(TypedDict):
+class SelectPieceRequest(BaseModel):
     gameId: str
-    piece: int
+    piece: Piece
+
+
+class PlacePieceRequest(BaseModel):
+    gameId: str
+    cell: Cell
+
+
+class GameStateUpdateResponse(TypedDict):
+    gameId: str
+    currentTurn: Literal[0, 1]
+    currentPlayerId: str | None
+    currentPiece: int | None
+    board: list[list[int | None]]
+    availablePieces: list[int]
+    winnerId: str | None
 
 
 class Emits(Enum):
@@ -65,15 +82,16 @@ class Emits(Enum):
 @sio.event  # type: ignore
 async def disconnect(sid: str, reason: str):
     logger.info(f"Client disconnected: {sid}, reason: {reason}")
-    game = next((game for game in db.list_all().values() if game.has_player(sid)), None)
-    if game:
-        game.leave(sid)
-        if game.is_empty():
-            db.delete(game.id)
-            logger.info(f"Game {game.id} deleted as it is empty.")
-        else:
-            response = PlayerLeftResponse(playerId=sid)
-            await sio.emit(Emits.PLAYER_LEFT.value, response, room=game.id)  # type: ignore
+    games = [game for game in db.list_all().values() if game.has_player(sid)]
+    if games:
+        for game in games:
+            game.leave(sid)
+            if game.is_empty():
+                db.delete(game.id)
+                logger.info(f"Game {game.id} deleted as it is empty.")
+            else:
+                response = PlayerLeftResponse(playerId=sid)
+                await sio.emit(Emits.PLAYER_LEFT.value, response, room=game.id)  # type: ignore
     return True
 
 
@@ -83,16 +101,52 @@ async def connect(sid: str, environ: object, auth: object):
     return True
 
 
-@sio.on("new-game")  # type: ignore
-async def create_new_game(sid: str):
+async def create_game(sid: str) -> Game:
+    await disconnect(sid, "Creating new game")
+
     game = Game()
     game.join(sid)
     db.create(game.id, game)
     await sio.enter_room(sid, game.id)  # type: ignore
-    logger.info(f"Game created with ID: {game.id} for client {sid}")
-    response = GameJoinedResponse(gameId=game.id, players=game.players)
 
-    await sio.emit(Emits.GAME_JOINED.value, response, room=sid)  # type: ignore
+    response = GameJoinedResponse(gameId=game.id, players=game.players)
+    await sio.emit(Emits.GAME_JOINED.value, response, to=sid)  # type: ignore
+
+    return game
+
+
+@sio.on("new-game")  # type: ignore
+async def create_new_game(sid: str):
+    game = await create_game(sid)
+    logger.info(f"Game created with ID: {game.id} for client {sid}")
+
+
+@sio.on("pve")  # type: ignore
+async def pve(
+    sid: str,
+):
+    logger.info(f"Client {sid} requested PVE game.")
+    if not agent:
+        await sio.emit(  # type: ignore
+            Emits.ERROR.value,
+            GenericErrorResponse(key="ERR_AGENT_NOT_CONFIGURED", message="Agent endpoint not configured"),
+            to=sid,
+        )
+        return
+    game = await create_game(sid)
+    if game.is_started:
+        await sio.emit(  # type: ignore
+            Emits.ERROR.value,
+            GenericErrorResponse(key="ERR_GAME_ALREADY_STARTED", message="Game has already started"),
+            to=sid,
+        )
+        return
+
+    await game.setup_pve(agent)
+    await start_game(sid, StartGameRequest(gameId=game.id))
+    if game.current_player != sid:
+        await game.agent_turn()
+        await emit_game_state_update(game)
 
 
 @sio.on("matchmaking")  # type: ignore
@@ -107,15 +161,15 @@ async def matchmaking(sid: str):
 
 
 @sio.on("join-game")  # type: ignore
-async def join_game(sid: str, data: JoinGameRequest):
-    game = db.read(data["gameId"])
+async def join_game(sid: str, request: JoinGameRequest):
+    game = db.read(request.gameId)
     if not game:
         await sio.emit(  # type: ignore
-            Emits.ERROR.value, GenericErrorResponse(key="ERR_GAME_NOT_FOUND", message="Game not found"), room=sid
+            Emits.ERROR.value, GenericErrorResponse(key="ERR_GAME_NOT_FOUND", message="Game not found"), to=sid
         )
         return
     if game.is_full():
-        await sio.emit(Emits.ERROR.value, GenericErrorResponse(key="ERR_GAME_FULL", message="Game is full"), room=sid)  # type: ignore
+        await sio.emit(Emits.ERROR.value, GenericErrorResponse(key="ERR_GAME_FULL", message="Game is full"), to=sid)  # type: ignore
         return
 
     game.join(sid)
@@ -129,8 +183,8 @@ async def join_game(sid: str, data: JoinGameRequest):
 
 
 @sio.on("start-game")  # type: ignore
-async def start_game(sid: str, data: StartGameRequest):
-    game = db.read(data["gameId"])
+async def start_game(sid: str, request: StartGameRequest):
+    game = db.read(request.gameId)
     if not game:
         await sio.emit(  # type: ignore
             Emits.ERROR.value, GenericErrorResponse(key="ERR_GAME_NOT_FOUND", message="Game not found"), to=sid
@@ -163,14 +217,14 @@ async def start_game(sid: str, data: StartGameRequest):
 
 
 @sio.on("select-piece")  # type: ignore
-async def select_piece(sid: str, data: SelectPieceRequest):
-    game = next((game for game in db.list_all().values() if game.id == data["gameId"]), None)
+async def select_piece(sid: str, request: SelectPieceRequest):
+    game = next((game for game in db.list_all().values() if game.id == request.gameId), None)
     if not game or not game.has_player(sid):
         await sio.emit(  # type: ignore
-            Emits.ERROR.value, GenericErrorResponse(key="ERR_GAME_NOT_FOUND", message="Game not found"), room=sid
+            Emits.ERROR.value, GenericErrorResponse(key="ERR_GAME_NOT_FOUND", message="Game not found"), to=sid
         )
         return
-    if not game.has_started:
+    if not game.is_started:
         await sio.emit(  # type: ignore
             Emits.ERROR.value,
             GenericErrorResponse(key="ERR_GAME_NOT_STARTED", message="Game has not started"),
@@ -191,32 +245,31 @@ async def select_piece(sid: str, data: SelectPieceRequest):
         )
         return
 
-    piece = Piece(data["piece"])
-    logger.info(f"Player {sid} selected piece {piece}")
+    logger.info(f"Player {sid} selected piece {request.piece}")
     try:
-        game.choose_piece(piece)
+        game.choose_piece(request.piece)
     except ValueError as e:
         await sio.emit(  # type: ignore
             Emits.ERROR.value, GenericErrorResponse(key="ERR_INVALID_MOVE", message=str(e)), to=sid
         )
         return
+
     await emit_game_state_update(game)
 
-
-class PlacePieceRequest(TypedDict):
-    gameId: str
-    cell: str
+    if game.is_pve and game.current_player != sid:
+        await game.agent_turn()
+        await emit_game_state_update(game)
 
 
 @sio.on("place-piece")  # type: ignore
-async def place_piece(sid: str, data: PlacePieceRequest):
-    game = next((game for game in db.list_all().values() if game.id == data["gameId"]), None)
+async def place_piece(sid: str, request: PlacePieceRequest):
+    game = next((game for game in db.list_all().values() if game.id == request.gameId), None)
     if not game or not game.has_player(sid):
         await sio.emit(  # type: ignore
             Emits.ERROR.value, GenericErrorResponse(key="ERR_GAME_NOT_FOUND", message="Game not found"), to=sid
         )
         return
-    if not game.has_started:
+    if not game.is_started:
         await sio.emit(  # type: ignore
             Emits.ERROR.value,
             GenericErrorResponse(key="ERR_GAME_NOT_STARTED", message="Game has not started"),
@@ -237,10 +290,9 @@ async def place_piece(sid: str, data: PlacePieceRequest):
         )
         return
 
-    cell = Cell[data["cell"]]
-    logger.info(f"Player {sid} placed piece at position {cell}")
+    logger.info(f"Player {sid} placed piece at position {request.cell}")
     try:
-        game.place_piece(cell)
+        game.place_piece(request.cell)
     except ValueError as e:
         await sio.emit(  # type: ignore
             Emits.ERROR.value, GenericErrorResponse(key="ERR_INVALID_MOVE", message=str(e)), to=sid
@@ -249,26 +301,20 @@ async def place_piece(sid: str, data: PlacePieceRequest):
 
     await emit_game_state_update(game)
 
-
-class GameStateUpdate(TypedDict):
-    gameId: str
-    currentTurn: Literal[0, 1]
-    currentPlayerId: str | None
-    currentPiece: int | None
-    board: list[list[int | None]]
-    availablePieces: list[int]
-    winnerId: str | None
+    if game.is_pve and game.current_player != sid:
+        await game.agent_turn()
+        await emit_game_state_update(game)
 
 
 async def emit_game_state_update(game: Game):
-    update = GameStateUpdate(
+    update = GameStateUpdateResponse(
         gameId=game.id,
         currentTurn=game.current_turn.value,
         currentPlayerId=game.current_player,
-        currentPiece=game.current_piece.value if game.current_piece else None,
-        board=[[piece.value if piece else None for piece in row] for row in game.board],
+        currentPiece=game.current_piece.value if game.current_piece is not None else None,
+        board=[[piece.value if piece is not None else None for piece in row] for row in game.board],
         availablePieces=[piece.value for piece in game.available_pieces],
-        winnerId=game.winner if game.winner else None,
+        winnerId=game.winner if game.winner is not None else None,
     )
 
     await sio.emit(Emits.GAME_STATE_UPDATED.value, update, room=game.id)  # type: ignore
