@@ -1,0 +1,11 @@
+{
+  "typeCheckingMode": "strict",
+  "ignore": [],
+  "exclude": [],
+  "include": ["."],
+  "perModuleOptions": {
+    "socketio": {
+      "reportMissingModuleSource": false,
+    }
+  } 
+}
