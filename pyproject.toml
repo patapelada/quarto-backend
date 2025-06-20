@@ -17,3 +17,10 @@ distribution = false
 [tool.pdm.scripts]
 dev = "dotenv run -- uvicorn quarto_backend.main:app --reload"
 prod = "uvicorn quarto_backend.main:app --host 0.0.0.0 --port 8000"
+[dependency-groups]
+ci = [
+    "git-cliff>=2.9.1",
+]
+dev = [
+    "pytest>=8.4.1",
+]
