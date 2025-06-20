@@ -1,7 +1,9 @@
 import logging
 import os
+import random
+import string
 from enum import Enum
-from typing import Literal, TypedDict
+from typing import Literal
 
 import pydantic_socketio
 from pydantic import BaseModel
@@ -26,6 +28,10 @@ class PlayerLeftResponse(BaseModel):
 class GameJoinedResponse(BaseModel):
     gameId: str
     players: list[str | None]
+
+
+class GameLeftResponse(BaseModel):
+    gameId: str
 
 
 class GameStartedResponse(BaseModel):
@@ -60,14 +66,16 @@ class PlacePieceRequest(BaseModel):
     cell: Cell
 
 
-class GameStateUpdateResponse(TypedDict):
+class GameStateUpdateResponse(BaseModel):
     gameId: str
     currentTurn: Literal[0, 1]
     currentPlayerId: str | None
     currentPiece: int | None
     board: list[list[int | None]]
     availablePieces: list[int]
-    winnerId: str | None
+    gameOver: bool = False
+    winnerId: str | None = None
+    winningLines: list[list[Cell]] = []
 
 
 class Emits(Enum):
@@ -75,23 +83,36 @@ class Emits(Enum):
     PLAYER_LEFT = "player-left"
     GAME_JOINED = "game-joined"
     GAME_STARTED = "game-started"
+    GAME_LEFT = "game-left"
     ERROR = "error"
     GAME_STATE_UPDATED = "game-state-updated"
+
+
+async def leave_games(sid: str):
+    games = [game for game in db.list_all().values() if game.has_player(sid)]
+    if not games:
+        return
+
+    for game in games:
+        game.leave(sid)
+        await sio.leave_room(sid, game.id)  # type: ignore
+        logger.info(f"Player {sid} left game {game.id}")
+
+        response = GameLeftResponse(gameId=game.id)
+        await sio.emit(Emits.GAME_LEFT.value, response, to=sid)  # type: ignore
+
+        if game.is_empty() or game.is_pve:
+            db.delete(game.id)
+            logger.info(f"Game {game.id} deleted as it is empty.")
+        else:
+            response = PlayerLeftResponse(playerId=sid)
+            await sio.emit(Emits.PLAYER_LEFT.value, response, room=game.id)  # type: ignore
 
 
 @sio.event  # type: ignore
 async def disconnect(sid: str, reason: str):
     logger.info(f"Client disconnected: {sid}, reason: {reason}")
-    games = [game for game in db.list_all().values() if game.has_player(sid)]
-    if games:
-        for game in games:
-            game.leave(sid)
-            if game.is_empty():
-                db.delete(game.id)
-                logger.info(f"Game {game.id} deleted as it is empty.")
-            else:
-                response = PlayerLeftResponse(playerId=sid)
-                await sio.emit(Emits.PLAYER_LEFT.value, response, room=game.id)  # type: ignore
+    await leave_games(sid)
     return True
 
 
@@ -101,10 +122,20 @@ async def connect(sid: str, environ: object, auth: object):
     return True
 
 
-async def create_game(sid: str) -> Game:
-    await disconnect(sid, "Creating new game")
+async def create_unique_game_id() -> str:
+    existing_ids = set(db.list_all().keys())
+    while True:
+        game_id = f"#{''.join(random.choices(string.ascii_uppercase + string.digits, k=4))}"
+        if game_id not in existing_ids:
+            return game_id
 
-    game = Game()
+
+async def create_game(sid: str) -> Game:
+    games = [game for game in db.list_all().values() if game.has_player(sid)]
+    if games:
+        return games[0]
+
+    game = Game(await create_unique_game_id())
     game.join(sid)
     db.create(game.id, game)
     await sio.enter_room(sid, game.id)  # type: ignore
@@ -119,6 +150,11 @@ async def create_game(sid: str) -> Game:
 async def create_new_game(sid: str):
     game = await create_game(sid)
     logger.info(f"Game created with ID: {game.id} for client {sid}")
+
+
+@sio.on("leave-game")  # type: ignore
+async def leave_game(sid: str):
+    await leave_games(sid)
 
 
 @sio.on("pve")  # type: ignore
@@ -171,6 +207,8 @@ async def join_game(sid: str, request: JoinGameRequest):
     if game.is_full():
         await sio.emit(Emits.ERROR.value, GenericErrorResponse(key="ERR_GAME_FULL", message="Game is full"), to=sid)  # type: ignore
         return
+
+    await leave_games(sid)
 
     game.join(sid)
     await sio.enter_room(sid, game.id)  # type: ignore
@@ -314,7 +352,9 @@ async def emit_game_state_update(game: Game):
         currentPiece=game.current_piece.value if game.current_piece is not None else None,
         board=[[piece.value if piece is not None else None for piece in row] for row in game.board],
         availablePieces=[piece.value for piece in game.available_pieces],
+        gameOver=game.is_game_over,
         winnerId=game.winner if game.winner is not None else None,
+        winningLines=game.winning_lines,
     )
 
     await sio.emit(Emits.GAME_STATE_UPDATED.value, update, room=game.id)  # type: ignore

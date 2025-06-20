@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 
 class Game:
-    def __init__(self):
-        self._id = uuid.uuid4()
+    def __init__(self, id: str | None = None):
+        self._id = id or str(uuid.uuid4())
         self._players: list[str | None] = [None, None]
         self._game = QuartoGame()
         self._start_timestamp = None
@@ -21,7 +21,7 @@ class Game:
 
     @property
     def id(self) -> str:
-        return str(self._id)
+        return self._id
 
     @property
     def players(self) -> list[str | None]:
@@ -42,6 +42,10 @@ class Game:
         return self._agent is not None
 
     @property
+    def is_game_over(self) -> bool:
+        return self._game.is_game_over
+
+    @property
     def current_turn(self) -> Turn:
         return self._game.current_turn
 
@@ -56,6 +60,10 @@ class Game:
     @property
     def available_cells(self) -> list[Cell]:
         return self._game.available_cells
+
+    @property
+    def winning_lines(self) -> list[list[Cell]]:
+        return self._game.winning_lines
 
     def is_full(self) -> bool:
         return all(player is not None for player in self._players)
@@ -113,10 +121,9 @@ class Game:
             raise ValueError("It's not the agent's turn.")
 
         if self.current_piece is None:
-            logger.debug("Agent is choosing the initial piece.")
             try:
                 response = await self._agent.choose_initial_piece()
-                logger.debug(f"Agent chose piece: {response.piece}")
+                logger.info(f"Agent chose piece: {response.piece}")
                 self.choose_piece(response.piece)
             except RuntimeError as e:
                 logger.error(f"Agent error during initial piece selection: {e}")
@@ -124,12 +131,11 @@ class Game:
 
             return
 
-        logger.debug("Agent is completing its turn.")
         try:
             response = await self._agent.complete_turn(GameState(current_piece=self.current_piece, board=self.board))
-            logger.debug(f"Agent completed turn with response: {response}")
+            logger.info(f"Agent completed turn with response: {response}")
             self.place_piece(response.cell)
-            if response.piece is not None:
+            if response.piece is not None and self.winner is None:
                 self.choose_piece(response.piece)
         except RuntimeError as e:
             logger.error(f"Agent error during turn completion: {e}")
