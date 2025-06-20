@@ -2,11 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2025-06-20
+
+### 🐛 Bug Fixes
+
+- Force re-build
+
 ## [0.1.1] - 2025-06-20
 
 ### 🐛 Bug Fixes
 
 - Add agent endpoint for testing purposes
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for release 0.1.1
 
 ## [0.1.0] - 2025-06-20
 
