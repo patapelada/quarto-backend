@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    types: [closed]
+    branches: ["main"]
+
+jobs:
+  release:
+    name: Release latest version
+    runs-on: ubuntu-latest
+    outputs:
+      release_body: ${{ steps.git-cliff.outputs.content }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up PDM
+        uses: pdm-project/setup-pdm@v4
+        with:
+          python-version: "3.13"
+          cache: true
+          cache-dependency-path: "**/pdm.lock"
+
+      - name: Install dependencies
+        run: |
+          pdm sync -G ci
+
+      - name: Generate changelog
+        id: git-cliff
+        run: |
+          pdm run git-cliff --verbose --bump -o CHANGELOG.md
+      - name: Set tag env variable
+        run: echo "NEW_TAG=$(pdm run git-cliff --bumped-version)" >> $GITHUB_ENV
+
+      - name: Commit to main
+        run: |
+          git checkout main
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add CHANGELOG.md
+          git commit -m "chore: update changelog for release ${{ env.NEW_TAG }}"
+          git tag ${{ env.NEW_TAG }}
+          git push https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git main
+          git push https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git ${{ env.NEW_TAG }}
+
+      - name: Upload the release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ env.NEW_TAG }}
+          body_path: CHANGELOG.md

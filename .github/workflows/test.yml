@@ -1,0 +1,35 @@
+name: Test
+
+on: [push]
+
+jobs:
+  test-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up PDM
+        uses: pdm-project/setup-pdm@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: true
+          cache-dependency-path: "**/pdm.lock"
+
+      - name: Install dependencies
+        run: |
+          pdm sync
+
+      - name: Run tests
+        run: pdm test --doctest-modules --junitxml=junit/test-results-${{ matrix.python-version }}.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-${{ matrix.python-version }}
+          path: junit/test-results-${{ matrix.python-version }}.xml
+        if: ${{ always() }}
